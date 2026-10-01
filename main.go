@@ -20,16 +20,22 @@ const (
 )
 
 type PR struct {
-	Number           int    `json:"number"`
-	Title            string `json:"title"`
-	HeadSHA          string `json:"headRefOid"`
-	MergeStateStatus string `json:"mergeStateStatus"`
-	Body             string `json:"body"`
+	Number      int    `json:"number"`
+	Title       string `json:"title"`
+	HeadRefName string `json:"headRefName"`
+	Body        string `json:"body"`
 }
 
 type Check struct {
 	Name  string `json:"name"`
 	State string `json:"state"`
+}
+
+type Comment struct {
+	Body   string `json:"body"`
+	Author struct {
+		Login string `json:"login"`
+	} `json:"author"`
 }
 
 type checksFailedError struct {
@@ -40,12 +46,10 @@ func (e *checksFailedError) Error() string {
 	return fmt.Sprintf("%d check(s) failed: %s", len(e.names), strings.Join(e.names, ", "))
 }
 
-type Comment struct {
-	Body   string `json:"body"`
-	Author struct {
-		Login string `json:"login"`
-	} `json:"author"`
-}
+// fatalError signals that processing should stop immediately.
+type fatalError struct{ error }
+
+func (e *fatalError) Unwrap() error { return e.error }
 
 func runGH(ctx context.Context, args ...string) ([]byte, error) {
 	out, err := exec.CommandContext(ctx, "gh", args...).Output()
@@ -58,12 +62,28 @@ func runGH(ctx context.Context, args ...string) ([]byte, error) {
 	return out, nil
 }
 
+func getDefaultBranch(ctx context.Context) (string, error) {
+	out, err := runGH(ctx, "repo", "view", "--json", "defaultBranchRef")
+	if err != nil {
+		return "", fmt.Errorf("get default branch: %w", err)
+	}
+	var repo struct {
+		DefaultBranchRef struct {
+			Name string `json:"name"`
+		} `json:"defaultBranchRef"`
+	}
+	if err := json.Unmarshal(out, &repo); err != nil {
+		return "", fmt.Errorf("parse default branch: %w", err)
+	}
+	return repo.DefaultBranchRef.Name, nil
+}
+
 func listDependabotPRs(ctx context.Context) ([]PR, error) {
 	out, err := runGH(ctx, "pr", "list",
 		"--author", "app/dependabot",
 		"--state", "open",
 		"--limit", "100",
-		"--json", "number,title,headRefOid,mergeStateStatus,body",
+		"--json", "number,title,headRefName,body",
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list PRs: %w", err)
@@ -78,37 +98,64 @@ func listDependabotPRs(ctx context.Context) ([]PR, error) {
 	return prs, nil
 }
 
-func getPRState(ctx context.Context, number int) (sha string, comments []Comment, err error) {
+func isBranchUpToDate(ctx context.Context, defaultBranch, prBranch string) (bool, error) {
+	fetchCmd := exec.CommandContext(ctx, "git", "fetch", "origin", //nolint:gosec
+		fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", defaultBranch, defaultBranch),
+		fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", prBranch, prBranch),
+	)
+	if out, err := fetchCmd.CombinedOutput(); err != nil {
+		return false, fmt.Errorf("git fetch: %s", strings.TrimSpace(string(out)))
+	}
+	err := exec.CommandContext(ctx, "git", "merge-base", "--is-ancestor", //nolint:gosec
+		"origin/"+defaultBranch, "origin/"+prBranch,
+	).Run()
+	if err == nil {
+		return true, nil
+	}
+	if ee, ok := errors.AsType[*exec.ExitError](err); ok && ee.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("git merge-base: %w", err)
+}
+
+func getPRBodyAndComments(ctx context.Context, number int) (body string, comments []Comment, err error) {
 	out, err := runGH(ctx, "pr", "view", fmt.Sprintf("%d", number),
-		"--json", "headRefOid,comments",
+		"--json", "body,comments",
 	)
 	if err != nil {
 		return "", nil, fmt.Errorf("view PR #%d: %w", number, err)
 	}
 	var state struct {
-		HeadSHA  string    `json:"headRefOid"`
+		Body     string    `json:"body"`
 		Comments []Comment `json:"comments"`
 	}
 	if err := json.Unmarshal(out, &state); err != nil {
 		return "", nil, fmt.Errorf("parse PR: %w", err)
 	}
-	return state.HeadSHA, state.Comments, nil
+	return state.Body, state.Comments, nil
 }
 
-func waitForRebase(ctx context.Context, number int, beforeSHA string) {
-	fmt.Printf("  Waiting for rebase (current %s)...\n", beforeSHA[:7])
+func waitForRebase(ctx context.Context, number int, defaultBranch, prBranch string) {
+	fmt.Println("  Waiting for rebase...")
 	deadline := time.Now().Add(rebaseTimeout)
 	for time.Now().Before(deadline) {
 		time.Sleep(pollInterval)
-		sha, comments, err := getPRState(ctx, number)
+
+		upToDate, err := isBranchUpToDate(ctx, defaultBranch, prBranch)
 		if err != nil {
-			fmt.Printf("  Warning: %v\n", err)
-			continue
-		}
-		if sha != beforeSHA {
-			fmt.Printf("  Rebased (new %s)\n", sha[:7])
+			fmt.Printf("  Warning (git): %v\n", err)
+		} else if upToDate {
+			fmt.Println("  Branch is up-to-date")
 			return
 		}
+
+		body, comments, err := getPRBodyAndComments(ctx, number)
+		if err != nil {
+			fmt.Printf("  Warning: %v\n", err)
+			fmt.Printf("  Still waiting... (%v remaining)\n", time.Until(deadline).Round(time.Minute))
+			continue
+		}
+
 		for _, c := range comments {
 			if c.Author.Login == "dependabot[bot]" &&
 				strings.Contains(c.Body, "Looks like this PR is already up-to-date with") {
@@ -116,14 +163,34 @@ func waitForRebase(ctx context.Context, number int, beforeSHA string) {
 				return
 			}
 		}
+
+		if !strings.Contains(body, "Dependabot is rebasing this PR") {
+			fmt.Println("  Rebase complete, continuing")
+			return
+		}
+
 		fmt.Printf("  Still waiting... (%v remaining)\n", time.Until(deadline).Round(time.Minute))
 	}
 	fmt.Println("  Rebase timed out — proceeding")
 }
 
+func classifyChecks(checks []Check) (pending int, failedNames []string) {
+	for _, c := range checks {
+		switch c.State {
+		case "success", "neutral", "skipped":
+			// passed
+		case "fail", "failure", "error", "cancelled", "timed_out", "action_required", "startup_failure", "stale":
+			failedNames = append(failedNames, c.Name)
+		default:
+			// pending, in_progress, queued, waiting, requested, or any unknown state
+			pending++
+		}
+	}
+	return pending, failedNames
+}
+
 func waitForChecks(ctx context.Context, number int) error {
 	fmt.Println("  Waiting for checks...")
-	// Give GitHub a moment to register the new commits
 	time.Sleep(15 * time.Second)
 	deadline := time.Now().Add(checksTimeout)
 	for time.Now().Before(deadline) {
@@ -131,7 +198,7 @@ func waitForChecks(ctx context.Context, number int) error {
 			"--json", "name,state",
 		)
 		if err != nil {
-			fmt.Printf("  Checks not ready yet, retrying...\n")
+			fmt.Println("  Checks not ready yet, retrying...")
 			time.Sleep(pollInterval)
 			continue
 		}
@@ -144,16 +211,7 @@ func waitForChecks(ctx context.Context, number int) error {
 			return nil
 		}
 
-		var pending int
-		var failedNames []string
-		for _, c := range checks {
-			switch c.State {
-			case "pending", "in_progress", "queued", "waiting", "requested":
-				pending++
-			case "fail", "failure", "error", "action_required", "startup_failure":
-				failedNames = append(failedNames, c.Name)
-			}
-		}
+		pending, failedNames := classifyChecks(checks)
 
 		if len(failedNames) > 0 {
 			return &checksFailedError{names: failedNames}
@@ -200,10 +258,14 @@ func mergePR(ctx context.Context, number int, title string) error {
 	return err
 }
 
-func processPR(ctx context.Context, pr PR) error {
+func processPR(ctx context.Context, pr PR, defaultBranch string) error {
 	fmt.Printf("\nPR #%d: %s\n", pr.Number, pr.Title)
 
-	if pr.MergeStateStatus == "BEHIND" {
+	upToDate, err := isBranchUpToDate(ctx, defaultBranch, pr.HeadRefName)
+	if err != nil {
+		return fmt.Errorf("check branch: %w", err)
+	}
+	if !upToDate {
 		if strings.Contains(pr.Body, "Dependabot is rebasing this PR") {
 			fmt.Println("  Rebase already in progress, waiting...")
 		} else {
@@ -214,13 +276,13 @@ func processPR(ctx context.Context, pr PR) error {
 				return fmt.Errorf("comment: %w", err)
 			}
 		}
-		waitForRebase(ctx, pr.Number, pr.HeadSHA)
+		waitForRebase(ctx, pr.Number, defaultBranch, pr.HeadRefName)
 	} else {
 		fmt.Println("  PR is up-to-date, skipping rebase")
 	}
 
 	if err := waitForChecks(ctx, pr.Number); err != nil {
-		return err
+		return &fatalError{err}
 	}
 
 	if err := ensureApproved(ctx, pr.Number); err != nil {
@@ -229,7 +291,7 @@ func processPR(ctx context.Context, pr PR) error {
 
 	fmt.Println("  Merging...")
 	if err := mergePR(ctx, pr.Number, pr.Title); err != nil {
-		return fmt.Errorf("merge: %w", err)
+		return &fatalError{fmt.Errorf("merge: %w", err)}
 	}
 
 	fmt.Printf("  Merged PR #%d\n", pr.Number)
@@ -238,6 +300,13 @@ func processPR(ctx context.Context, pr PR) error {
 
 func main() {
 	ctx := context.Background()
+
+	defaultBranch, err := getDefaultBranch(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
 	fmt.Println("Fetching open dependabot PRs...")
 	prs, err := listDependabotPRs(ctx)
 	if err != nil {
@@ -254,9 +323,9 @@ func main() {
 
 	var failed []int
 	for _, pr := range prs {
-		if err := processPR(ctx, pr); err != nil {
+		if err := processPR(ctx, pr, defaultBranch); err != nil {
 			fmt.Fprintf(os.Stderr, "  FAILED PR #%d: %v\n", pr.Number, err)
-			if _, ok := errors.AsType[*checksFailedError](err); ok {
+			if _, ok := errors.AsType[*fatalError](err); ok {
 				os.Exit(1)
 			}
 			failed = append(failed, pr.Number)
