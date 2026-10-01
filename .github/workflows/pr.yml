@@ -1,0 +1,16 @@
+name: PR
+on:
+  pull_request: { }
+
+permissions: {}
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Go
+    permissions:
+      contents: read
+    uses: $/.github/workflows/build.yaml
