@@ -256,8 +256,7 @@ func main() {
 	for _, pr := range prs {
 		if err := processPR(ctx, pr); err != nil {
 			fmt.Fprintf(os.Stderr, "  FAILED PR #%d: %v\n", pr.Number, err)
-			var cfe *checksFailedError
-			if errors.As(err, &cfe) {
+			if _, ok := errors.AsType[*checksFailedError](err); ok {
 				os.Exit(1)
 			}
 			failed = append(failed, pr.Number)
