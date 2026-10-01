@@ -14,10 +14,10 @@ For each dependabot PR:
 
 ### build
 
-Compiles the binary to `build/aprc`.
+Compiles the binary to `build/depram`.
 
 ```
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o build/aprc .
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o build/depram .
 ```
 
 ### install
@@ -27,7 +27,7 @@ Requires: build
 Copies the binary to `GOBIN`.
 
 ```
-cp build/aprc $(go env GOBIN)/aprc
+cp build/depram $(go env GOBIN)/depram
 ```
 
 ### sast
