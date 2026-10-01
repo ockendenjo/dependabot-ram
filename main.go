@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -19,14 +20,22 @@ const (
 )
 
 type PR struct {
-	Number  int    `json:"number"`
-	Title   string `json:"title"`
-	HeadSHA string `json:"headRefOid"`
+	Number          int    `json:"number"`
+	Title           string `json:"title"`
+	HeadSHA         string `json:"headRefOid"`
+	MergeStateStatus string `json:"mergeStateStatus"`
 }
 
 type Check struct {
 	Name  string `json:"name"`
 	State string `json:"state"`
+}
+
+type Comment struct {
+	Body   string `json:"body"`
+	Author struct {
+		Login string `json:"login"`
+	} `json:"author"`
 }
 
 func runGH(ctx context.Context, args ...string) ([]byte, error) {
@@ -45,7 +54,7 @@ func listDependabotPRs(ctx context.Context) ([]PR, error) {
 		"--author", "app/dependabot",
 		"--state", "open",
 		"--limit", "100",
-		"--json", "number,title,headRefOid",
+		"--json", "number,title,headRefOid,mergeStateStatus",
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list PRs: %w", err)
@@ -60,18 +69,21 @@ func listDependabotPRs(ctx context.Context) ([]PR, error) {
 	return prs, nil
 }
 
-func getCurrentSHA(ctx context.Context, number int) (string, error) {
+func getPRState(ctx context.Context, number int) (sha string, comments []Comment, err error) {
 	out, err := runGH(ctx, "pr", "view", fmt.Sprintf("%d", number),
-		"--json", "headRefOid",
+		"--json", "headRefOid,comments",
 	)
 	if err != nil {
-		return "", fmt.Errorf("view PR #%d: %w", number, err)
+		return "", nil, fmt.Errorf("view PR #%d: %w", number, err)
 	}
-	var pr PR
-	if err := json.Unmarshal(out, &pr); err != nil {
-		return "", fmt.Errorf("parse PR: %w", err)
+	var state struct {
+		HeadSHA  string    `json:"headRefOid"`
+		Comments []Comment `json:"comments"`
 	}
-	return pr.HeadSHA, nil
+	if err := json.Unmarshal(out, &state); err != nil {
+		return "", nil, fmt.Errorf("parse PR: %w", err)
+	}
+	return state.HeadSHA, state.Comments, nil
 }
 
 func waitForRebase(ctx context.Context, number int, beforeSHA string) {
@@ -79,7 +91,7 @@ func waitForRebase(ctx context.Context, number int, beforeSHA string) {
 	deadline := time.Now().Add(rebaseTimeout)
 	for time.Now().Before(deadline) {
 		time.Sleep(pollInterval)
-		sha, err := getCurrentSHA(ctx, number)
+		sha, comments, err := getPRState(ctx, number)
 		if err != nil {
 			fmt.Printf("  Warning: %v\n", err)
 			continue
@@ -88,9 +100,16 @@ func waitForRebase(ctx context.Context, number int, beforeSHA string) {
 			fmt.Printf("  Rebased (new %s)\n", sha[:7])
 			return
 		}
+		for _, c := range comments {
+			if c.Author.Login == "dependabot[bot]" &&
+				strings.Contains(c.Body, "Looks like this PR is already up-to-date with") {
+				fmt.Println("  Already up-to-date, continuing")
+				return
+			}
+		}
 		fmt.Printf("  Still waiting... (%v remaining)\n", time.Until(deadline).Round(time.Minute))
 	}
-	fmt.Println("  Rebase timed out — PR may already be up to date, proceeding")
+	fmt.Println("  Rebase timed out — proceeding")
 }
 
 func waitForChecks(ctx context.Context, number int) error {
@@ -152,14 +171,17 @@ func mergePR(ctx context.Context, number int, title string) error {
 func processPR(ctx context.Context, pr PR) error {
 	fmt.Printf("\nPR #%d: %s\n", pr.Number, pr.Title)
 
-	fmt.Println("  Requesting rebase...")
-	if _, err := runGH(ctx, "pr", "comment", fmt.Sprintf("%d", pr.Number),
-		"--body", "@dependabot rebase",
-	); err != nil {
-		return fmt.Errorf("comment: %w", err)
+	if pr.MergeStateStatus == "BEHIND" {
+		fmt.Println("  PR is behind base branch, requesting rebase...")
+		if _, err := runGH(ctx, "pr", "comment", fmt.Sprintf("%d", pr.Number),
+			"--body", "@dependabot rebase",
+		); err != nil {
+			return fmt.Errorf("comment: %w", err)
+		}
+		waitForRebase(ctx, pr.Number, pr.HeadSHA)
+	} else {
+		fmt.Println("  PR is up-to-date, skipping rebase")
 	}
-
-	waitForRebase(ctx, pr.Number, pr.HeadSHA)
 
 	if err := waitForChecks(ctx, pr.Number); err != nil {
 		return err
