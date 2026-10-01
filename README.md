@@ -33,6 +33,7 @@ cp build/depram $(go env GOBIN)/depram
 ### sast
 
 ```shell
+go fix -diff ./...
 wget -O .golangci.json https://raw.githubusercontent.com/ockendenjo/actions/refs/heads/main/.golangci.json
 golangci-lint run
 govulncheck ./...

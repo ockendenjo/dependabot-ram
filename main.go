@@ -20,15 +20,24 @@ const (
 )
 
 type PR struct {
-	Number          int    `json:"number"`
-	Title           string `json:"title"`
-	HeadSHA         string `json:"headRefOid"`
+	Number           int    `json:"number"`
+	Title            string `json:"title"`
+	HeadSHA          string `json:"headRefOid"`
 	MergeStateStatus string `json:"mergeStateStatus"`
+	Body             string `json:"body"`
 }
 
 type Check struct {
 	Name  string `json:"name"`
 	State string `json:"state"`
+}
+
+type checksFailedError struct {
+	names []string
+}
+
+func (e *checksFailedError) Error() string {
+	return fmt.Sprintf("%d check(s) failed: %s", len(e.names), strings.Join(e.names, ", "))
 }
 
 type Comment struct {
@@ -54,7 +63,7 @@ func listDependabotPRs(ctx context.Context) ([]PR, error) {
 		"--author", "app/dependabot",
 		"--state", "open",
 		"--limit", "100",
-		"--json", "number,title,headRefOid,mergeStateStatus",
+		"--json", "number,title,headRefOid,mergeStateStatus,body",
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list PRs: %w", err)
@@ -135,18 +144,19 @@ func waitForChecks(ctx context.Context, number int) error {
 			return nil
 		}
 
-		var pending, failed int
+		var pending int
+		var failedNames []string
 		for _, c := range checks {
 			switch c.State {
 			case "pending", "in_progress", "queued", "waiting", "requested":
 				pending++
 			case "fail", "failure", "error", "action_required", "startup_failure":
-				failed++
+				failedNames = append(failedNames, c.Name)
 			}
 		}
 
-		if failed > 0 {
-			return fmt.Errorf("%d check(s) failed", failed)
+		if len(failedNames) > 0 {
+			return &checksFailedError{names: failedNames}
 		}
 		if pending == 0 {
 			fmt.Printf("  All %d check(s) passed\n", len(checks))
@@ -157,6 +167,28 @@ func waitForChecks(ctx context.Context, number int) error {
 		time.Sleep(pollInterval)
 	}
 	return fmt.Errorf("checks timed out after %v", checksTimeout)
+}
+
+func ensureApproved(ctx context.Context, number int) error {
+	out, err := runGH(ctx, "pr", "view", fmt.Sprintf("%d", number),
+		"--json", "reviewDecision",
+	)
+	if err != nil {
+		return fmt.Errorf("view PR #%d: %w", number, err)
+	}
+	var state struct {
+		ReviewDecision string `json:"reviewDecision"`
+	}
+	if err := json.Unmarshal(out, &state); err != nil {
+		return fmt.Errorf("parse review decision: %w", err)
+	}
+	if state.ReviewDecision == "APPROVED" {
+		fmt.Println("  PR already approved")
+		return nil
+	}
+	fmt.Println("  Approving PR...")
+	_, err = runGH(ctx, "pr", "review", fmt.Sprintf("%d", number), "--approve")
+	return err
 }
 
 func mergePR(ctx context.Context, number int, title string) error {
@@ -172,11 +204,15 @@ func processPR(ctx context.Context, pr PR) error {
 	fmt.Printf("\nPR #%d: %s\n", pr.Number, pr.Title)
 
 	if pr.MergeStateStatus == "BEHIND" {
-		fmt.Println("  PR is behind base branch, requesting rebase...")
-		if _, err := runGH(ctx, "pr", "comment", fmt.Sprintf("%d", pr.Number),
-			"--body", "@dependabot rebase",
-		); err != nil {
-			return fmt.Errorf("comment: %w", err)
+		if strings.Contains(pr.Body, "Dependabot is rebasing this PR") {
+			fmt.Println("  Rebase already in progress, waiting...")
+		} else {
+			fmt.Println("  PR is behind base branch, requesting rebase...")
+			if _, err := runGH(ctx, "pr", "comment", fmt.Sprintf("%d", pr.Number),
+				"--body", "@dependabot rebase",
+			); err != nil {
+				return fmt.Errorf("comment: %w", err)
+			}
 		}
 		waitForRebase(ctx, pr.Number, pr.HeadSHA)
 	} else {
@@ -185,6 +221,10 @@ func processPR(ctx context.Context, pr PR) error {
 
 	if err := waitForChecks(ctx, pr.Number); err != nil {
 		return err
+	}
+
+	if err := ensureApproved(ctx, pr.Number); err != nil {
+		return fmt.Errorf("approve: %w", err)
 	}
 
 	fmt.Println("  Merging...")
@@ -216,6 +256,9 @@ func main() {
 	for _, pr := range prs {
 		if err := processPR(ctx, pr); err != nil {
 			fmt.Fprintf(os.Stderr, "  FAILED PR #%d: %v\n", pr.Number, err)
+			if _, ok := errors.AsType[*checksFailedError](err); ok {
+				os.Exit(1)
+			}
 			failed = append(failed, pr.Number)
 		}
 	}
