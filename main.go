@@ -14,9 +14,10 @@ import (
 )
 
 const (
-	pollInterval  = 30 * time.Second
-	rebaseTimeout = 15 * time.Minute
-	checksTimeout = 60 * time.Minute
+	rebasePollInterval = 20 * time.Second
+	checksPollInterval = 10 * time.Second
+	rebaseTimeout      = 15 * time.Minute
+	checksTimeout      = 60 * time.Minute
 )
 
 type PR struct {
@@ -139,7 +140,7 @@ func waitForRebase(ctx context.Context, number int, defaultBranch, prBranch stri
 	fmt.Println("  Waiting for rebase...")
 	deadline := time.Now().Add(rebaseTimeout)
 	for time.Now().Before(deadline) {
-		time.Sleep(pollInterval)
+		time.Sleep(rebasePollInterval)
 
 		upToDate, err := isBranchUpToDate(ctx, defaultBranch, prBranch)
 		if err != nil {
@@ -199,7 +200,7 @@ func waitForChecks(ctx context.Context, number int) error {
 		)
 		if err != nil {
 			fmt.Println("  Checks not ready yet, retrying...")
-			time.Sleep(pollInterval)
+			time.Sleep(checksPollInterval)
 			continue
 		}
 		var checks []Check
@@ -222,7 +223,7 @@ func waitForChecks(ctx context.Context, number int) error {
 		}
 		fmt.Printf("  %d/%d check(s) still running (%v remaining)...\n",
 			pending, len(checks), time.Until(deadline).Round(time.Minute))
-		time.Sleep(pollInterval)
+		time.Sleep(checksPollInterval)
 	}
 	return fmt.Errorf("checks timed out after %v", checksTimeout)
 }
@@ -249,6 +250,20 @@ func ensureApproved(ctx context.Context, number int) error {
 	return err
 }
 
+func isMergeable(ctx context.Context, number int) (bool, error) {
+	out, err := runGH(ctx, "pr", "view", fmt.Sprintf("%d", number), "--json", "mergeStateStatus")
+	if err != nil {
+		return false, fmt.Errorf("view PR #%d: %w", number, err)
+	}
+	var state struct {
+		MergeStateStatus string `json:"mergeStateStatus"`
+	}
+	if err := json.Unmarshal(out, &state); err != nil {
+		return false, fmt.Errorf("parse merge state: %w", err)
+	}
+	return state.MergeStateStatus != "DIRTY", nil
+}
+
 func prIsOpen(ctx context.Context, number int) (bool, error) {
 	out, err := runGH(ctx, "pr", "view", fmt.Sprintf("%d", number), "--json", "state")
 	if err != nil {
@@ -271,6 +286,61 @@ func mergePR(ctx context.Context, number int) error {
 	return err
 }
 
+func prepareGitHubActionPR(ctx context.Context, pr PR, defaultBranch string) (skip bool, err error) {
+	fmt.Println("  GitHub Actions bump — checking mergeability...")
+	mergeable, err := isMergeable(ctx, pr.Number)
+	if err != nil {
+		return false, fmt.Errorf("check mergeability: %w", err)
+	}
+	if !mergeable {
+		fmt.Println("  PR has merge conflicts, requesting rebase...")
+		if _, err := runGH(ctx, "pr", "comment", fmt.Sprintf("%d", pr.Number),
+			"--body", "@dependabot rebase",
+		); err != nil {
+			return false, fmt.Errorf("comment: %w", err)
+		}
+		waitForRebase(ctx, pr.Number, defaultBranch, pr.HeadRefName)
+		mergeable, err = isMergeable(ctx, pr.Number)
+		if err != nil {
+			return false, fmt.Errorf("check mergeability after rebase: %w", err)
+		}
+		if !mergeable {
+			fmt.Println("  Still has merge conflicts after rebase, skipping")
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// prepareForMerge handles the type-specific pre-merge logic.
+// Returns (true, nil) if the PR should be skipped.
+func prepareForMerge(ctx context.Context, pr PR, defaultBranch string) (skip bool, err error) {
+	if strings.HasPrefix(pr.HeadRefName, "dependabot/github_actions/") {
+		return prepareGitHubActionPR(ctx, pr, defaultBranch)
+	}
+
+	upToDate, err := isBranchUpToDate(ctx, defaultBranch, pr.HeadRefName)
+	if err != nil {
+		return false, fmt.Errorf("check branch: %w", err)
+	}
+	if upToDate {
+		fmt.Println("  PR is up-to-date, skipping rebase")
+		return false, nil
+	}
+	if strings.Contains(pr.Body, "Dependabot is rebasing this PR") {
+		fmt.Println("  Rebase already in progress, waiting...")
+	} else {
+		fmt.Println("  PR is behind base branch, requesting rebase...")
+		if _, err := runGH(ctx, "pr", "comment", fmt.Sprintf("%d", pr.Number),
+			"--body", "@dependabot rebase",
+		); err != nil {
+			return false, fmt.Errorf("comment: %w", err)
+		}
+	}
+	waitForRebase(ctx, pr.Number, defaultBranch, pr.HeadRefName)
+	return false, nil
+}
+
 func processPR(ctx context.Context, pr PR, defaultBranch string) error {
 	fmt.Printf("\nPR #%d: %s\n", pr.Number, pr.Title)
 
@@ -283,24 +353,12 @@ func processPR(ctx context.Context, pr PR, defaultBranch string) error {
 		return nil
 	}
 
-	upToDate, err := isBranchUpToDate(ctx, defaultBranch, pr.HeadRefName)
+	skip, err := prepareForMerge(ctx, pr, defaultBranch)
 	if err != nil {
-		return fmt.Errorf("check branch: %w", err)
+		return err
 	}
-	if !upToDate {
-		if strings.Contains(pr.Body, "Dependabot is rebasing this PR") {
-			fmt.Println("  Rebase already in progress, waiting...")
-		} else {
-			fmt.Println("  PR is behind base branch, requesting rebase...")
-			if _, err := runGH(ctx, "pr", "comment", fmt.Sprintf("%d", pr.Number),
-				"--body", "@dependabot rebase",
-			); err != nil {
-				return fmt.Errorf("comment: %w", err)
-			}
-		}
-		waitForRebase(ctx, pr.Number, defaultBranch, pr.HeadRefName)
-	} else {
-		fmt.Println("  PR is up-to-date, skipping rebase")
+	if skip {
+		return nil
 	}
 
 	if err := waitForChecks(ctx, pr.Number); err != nil {
