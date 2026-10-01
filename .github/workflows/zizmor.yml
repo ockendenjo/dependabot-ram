@@ -1,0 +1,41 @@
+name: zizmor
+
+on:
+  push:
+    branches: [ 'main' ]
+    paths: [ '.github/workflows/**' ]
+  pull_request:
+    branches: [ 'main' ]
+    paths: [ '.github/workflows/**' ]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zizmor:
+    name: Run zizmor
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read         # Only needed for private repos. Needed to clone the repo.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download zizmor
+        shell: bash
+        run: |
+          wget -nv https://github.com/zizmorcore/zizmor/releases/download/v1.30.1/zizmor-x86_64-unknown-linux-gnu.tar.gz
+          echo "e65324f4430c2717591937edcec90ccbefaf14c174f8ec9415e03ca875b46e1a  zizmor-x86_64-unknown-linux-gnu.tar.gz" | sha256sum --check
+          tar -xvzf zizmor-x86_64-unknown-linux-gnu.tar.gz
+
+      - name: Run zizmor
+        shell: bash
+        run: |
+          ./zizmor --pedantic ./.github/
+        env:
+          GH_TOKEN: ${{ github.token }}
