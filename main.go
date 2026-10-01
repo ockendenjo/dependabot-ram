@@ -176,7 +176,7 @@ func waitForRebase(ctx context.Context, number int, defaultBranch, prBranch stri
 
 func classifyChecks(checks []Check) (pending int, failedNames []string) {
 	for _, c := range checks {
-		switch c.State {
+		switch strings.ToLower(c.State) {
 		case "success", "neutral", "skipped":
 			// passed
 		case "fail", "failure", "error", "cancelled", "timed_out", "action_required", "startup_failure", "stale":
@@ -249,10 +249,23 @@ func ensureApproved(ctx context.Context, number int) error {
 	return err
 }
 
-func mergePR(ctx context.Context, number int, title string) error {
+func prIsOpen(ctx context.Context, number int) (bool, error) {
+	out, err := runGH(ctx, "pr", "view", fmt.Sprintf("%d", number), "--json", "state")
+	if err != nil {
+		return false, nil // PR not found or inaccessible — treat as closed
+	}
+	var pr struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(out, &pr); err != nil {
+		return false, fmt.Errorf("parse PR state: %w", err)
+	}
+	return strings.EqualFold(pr.State, "open"), nil
+}
+
+func mergePR(ctx context.Context, number int) error {
 	_, err := runGH(ctx, "pr", "merge", fmt.Sprintf("%d", number),
 		"--squash",
-		"--subject", title,
 		"--body", "",
 	)
 	return err
@@ -260,6 +273,15 @@ func mergePR(ctx context.Context, number int, title string) error {
 
 func processPR(ctx context.Context, pr PR, defaultBranch string) error {
 	fmt.Printf("\nPR #%d: %s\n", pr.Number, pr.Title)
+
+	open, err := prIsOpen(ctx, pr.Number)
+	if err != nil {
+		return fmt.Errorf("check PR state: %w", err)
+	}
+	if !open {
+		fmt.Println("  PR no longer open, skipping")
+		return nil
+	}
 
 	upToDate, err := isBranchUpToDate(ctx, defaultBranch, pr.HeadRefName)
 	if err != nil {
@@ -290,7 +312,7 @@ func processPR(ctx context.Context, pr PR, defaultBranch string) error {
 	}
 
 	fmt.Println("  Merging...")
-	if err := mergePR(ctx, pr.Number, pr.Title); err != nil {
+	if err := mergePR(ctx, pr.Number); err != nil {
 		return &fatalError{fmt.Errorf("merge: %w", err)}
 	}
 
