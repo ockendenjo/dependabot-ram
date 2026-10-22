@@ -286,58 +286,69 @@ func mergePR(ctx context.Context, number int) error {
 	return err
 }
 
-func prepareGitHubActionPR(ctx context.Context, pr PR, defaultBranch string) (skip bool, err error) {
-	fmt.Println("  GitHub Actions bump — checking mergeability...")
+func checksHaveFailed(ctx context.Context, number int) (bool, error) {
+	out, err := runGH(ctx, "pr", "checks", fmt.Sprintf("%d", number), "--json", "name,state")
+	if err != nil {
+		return false, nil // checks not ready yet
+	}
+	var checks []Check
+	if err := json.Unmarshal(out, &checks); err != nil {
+		return false, fmt.Errorf("parse checks: %w", err)
+	}
+	_, failedNames := classifyChecks(checks)
+	return len(failedNames) > 0, nil
+}
+
+func doRebase(ctx context.Context, pr PR, defaultBranch string) {
+	body, _, err := getPRBodyAndComments(ctx, pr.Number)
+	if err != nil {
+		fmt.Printf("  Warning fetching PR body: %v\n", err)
+	}
+	if err != nil || !strings.Contains(body, "Dependabot is rebasing this PR") {
+		fmt.Println("  Requesting rebase...")
+		if _, rerr := runGH(ctx, "pr", "comment", fmt.Sprintf("%d", pr.Number),
+			"--body", "@dependabot rebase",
+		); rerr != nil {
+			fmt.Printf("  Warning: could not post rebase comment: %v\n", rerr)
+		}
+	} else {
+		fmt.Println("  Rebase already in progress, waiting...")
+	}
+	waitForRebase(ctx, pr.Number, defaultBranch, pr.HeadRefName)
+}
+
+// prepareForMerge handles the pre-merge rebase check.
+// Returns (true, nil) if the PR should be skipped.
+func prepareForMerge(ctx context.Context, pr PR, defaultBranch string) (skip bool, err error) {
 	mergeable, err := isMergeable(ctx, pr.Number)
 	if err != nil {
 		return false, fmt.Errorf("check mergeability: %w", err)
 	}
-	if !mergeable {
-		fmt.Println("  PR has merge conflicts, requesting rebase...")
-		if _, err := runGH(ctx, "pr", "comment", fmt.Sprintf("%d", pr.Number),
-			"--body", "@dependabot rebase",
-		); err != nil {
-			return false, fmt.Errorf("comment: %w", err)
-		}
-		waitForRebase(ctx, pr.Number, defaultBranch, pr.HeadRefName)
-		mergeable, err = isMergeable(ctx, pr.Number)
-		if err != nil {
-			return false, fmt.Errorf("check mergeability after rebase: %w", err)
-		}
-		if !mergeable {
-			fmt.Println("  Still has merge conflicts after rebase, skipping")
-			return true, nil
-		}
-	}
-	return false, nil
-}
 
-// prepareForMerge handles the type-specific pre-merge logic.
-// Returns (true, nil) if the PR should be skipped.
-func prepareForMerge(ctx context.Context, pr PR, defaultBranch string) (skip bool, err error) {
-	if strings.HasPrefix(pr.HeadRefName, "dependabot/github_actions/") {
-		return prepareGitHubActionPR(ctx, pr, defaultBranch)
-	}
-
-	upToDate, err := isBranchUpToDate(ctx, defaultBranch, pr.HeadRefName)
+	failed, err := checksHaveFailed(ctx, pr.Number)
 	if err != nil {
-		return false, fmt.Errorf("check branch: %w", err)
+		return false, fmt.Errorf("check checks: %w", err)
 	}
-	if upToDate {
-		fmt.Println("  PR is up-to-date, skipping rebase")
+
+	if mergeable && !failed {
 		return false, nil
 	}
-	if strings.Contains(pr.Body, "Dependabot is rebasing this PR") {
-		fmt.Println("  Rebase already in progress, waiting...")
+
+	if !mergeable {
+		fmt.Println("  PR has merge conflicts, requesting rebase...")
 	} else {
-		fmt.Println("  PR is behind base branch, requesting rebase...")
-		if _, err := runGH(ctx, "pr", "comment", fmt.Sprintf("%d", pr.Number),
-			"--body", "@dependabot rebase",
-		); err != nil {
-			return false, fmt.Errorf("comment: %w", err)
-		}
+		fmt.Println("  PR checks have failed, requesting rebase...")
 	}
-	waitForRebase(ctx, pr.Number, defaultBranch, pr.HeadRefName)
+	doRebase(ctx, pr, defaultBranch)
+
+	mergeable, err = isMergeable(ctx, pr.Number)
+	if err != nil {
+		return false, fmt.Errorf("check mergeability after rebase: %w", err)
+	}
+	if !mergeable {
+		fmt.Println("  Still has merge conflicts after rebase, skipping")
+		return true, nil
+	}
 	return false, nil
 }
 
