@@ -15,28 +15,21 @@ Check the PR is still open (Dependabot may have closed it since the list was fet
 
 ### 2. Rebase check (type-dependent)
 
-Determine the PR type from its branch name:
-
-**GitHub Actions bump** (`dependabot/github_actions/` branch prefix):
-- Check `mergeStateStatus` using the GitHub CLI
-- If `DIRTY` (merge conflict):
-  - Comment `@dependabot rebase` on the PR
-  - Wait for the rebase to complete using the same polling logic as node packages (20s interval, 15 minute timeout)
+- If `DIRTY` (merge conflict), or the PR checks have failed:
+  - Rebase the PR using instructions in section [3](#3-doing-a-rebase)
   - If still dirty after the rebase, skip to the next PR
-- Otherwise proceed to step 3
+- Otherwise proceed to step [4](#4-wait-for-checks)
 
-**Node package bump** (all other Dependabot branches):
-- Use `git` to check whether the default branch is an ancestor of the PR branch (i.e. the PR is up-to-date)
-- If the PR is behind:
-  - If the PR body contains `Dependabot is rebasing this PR`, a rebase is already in progress — skip requesting one
-  - Otherwise comment `@dependabot rebase` on the PR
-  - Poll every 20s until the rebase is complete. The rebase is considered complete when any of the following is true:
-    - `git` confirms the default branch is now an ancestor of the PR branch
-    - The PR body no longer contains `Dependabot is rebasing this PR`
-    - Dependabot comments `Looks like this PR is already up-to-date with <branch>!`
-  - Timeout after 15 minutes and proceed anyway
+### 3. Doing a rebase
+- If the PR body contains `Dependabot is rebasing this PR`, a rebase is already in progress — skip requesting one
+- Otherwise comment `@dependabot rebase` on the PR
+- Poll every 20s until the rebase is complete. The rebase is considered complete when any of the following is true:
+  - `git` confirms the default branch is now an ancestor of the PR branch
+  - The PR body no longer contains `Dependabot is rebasing this PR`
+  - Dependabot comments `Looks like this PR is already up-to-date with <branch>!`
+  - Timeout after 15 minutes
 
-### 3. Wait for checks
+### 4. Wait for checks
 
 Poll every 10s (timeout 60 minutes) until all PR checks reach a terminal state.
 
@@ -50,11 +43,11 @@ Check state classification (case-insensitive):
 
 If any checks fail: print the failed check names and exit with a non-zero exit code.
 
-### 4. Approval
+### 5. Approval
 
 Check `reviewDecision` using the GitHub CLI. If the PR is not already approved, approve it.
 
-### 5. Merge
+### 6. Merge
 
 Squash-merge the PR using the default summary, with a blank body.
 
